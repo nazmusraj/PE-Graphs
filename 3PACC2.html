@@ -1,0 +1,433 @@
+import React, { useState, useMemo, useRef, useEffect } from 'react';
+
+// --- Constants & Math Helpers ---
+const DEG2RAD = Math.PI / 180;
+const V_PEAK_PHASE = 50; 
+const V_PEAK_LINE = V_PEAK_PHASE * Math.sqrt(3);
+
+const vA = (theta) => V_PEAK_PHASE * Math.sin(theta * DEG2RAD);
+const vB = (theta) => V_PEAK_PHASE * Math.sin((theta - 120) * DEG2RAD);
+const vC = (theta) => V_PEAK_PHASE * Math.sin((theta - 240) * DEG2RAD);
+
+const colors = {
+  phaseA: '#ef4444', // Red
+  phaseB: '#22c55e', // Green
+  phaseC: '#3b82f6', // Blue
+  lineAB: '#ec4899', // Pink
+  lineBC: '#06b6d4', // Cyan
+  lineCA: '#eab308', // Yellow
+  pulse: '#8b5cf6',  // Purple
+  grid: '#334155',   // Slate 700
+  text: '#94a3b8'    // Slate 400
+};
+
+export default function App() {
+  // --- State ---
+  const [alpha, setAlpha] = useState(60); // Firing angle in degrees
+  const [pulseWidth, setPulseWidth] = useState(120); // Pulse width in degrees
+  const [isSymmetric, setIsSymmetric] = useState(true);
+  
+  // Custom pulses state (only used if isSymmetric is false)
+  // Array indices: 0->T1, 1->T2, 2->T3, 3->T4, 4->T5, 5->T6
+  const [customPulses, setCustomPulses] = useState([
+    { start: 0, width: 120 },
+    { start: 60, width: 120 },
+    { start: 120, width: 120 },
+    { start: 180, width: 120 },
+    { start: 240, width: 120 },
+    { start: 300, width: 120 }
+  ]);
+
+  const svgRef = useRef(null);
+  const [dragState, setDragState] = useState(null);
+
+  // --- Display Toggles State ---
+  const [visibleTraces, setVisibleTraces] = useState({
+    Va: true, Vb: true, Vc: true,
+    Vab: true, Vbc: true, Vca: true,
+    van: true, vbn: true, vcn: true
+  });
+
+  const toggleTrace = (key) => {
+    setVisibleTraces(prev => ({ ...prev, [key]: !prev[key] }));
+  };
+
+  // --- Derived Pulses ---
+  const activePulses = useMemo(() => {
+    if (isSymmetric) {
+      return [
+        { start: (0 + alpha) % 360, width: pulseWidth },
+        { start: (60 + alpha) % 360, width: pulseWidth },
+        { start: (120 + alpha) % 360, width: pulseWidth },
+        { start: (180 + alpha) % 360, width: pulseWidth },
+        { start: (240 + alpha) % 360, width: pulseWidth },
+        { start: (300 + alpha) % 360, width: pulseWidth },
+      ];
+    }
+    return customPulses;
+  }, [alpha, pulseWidth, isSymmetric, customPulses]);
+
+  // --- Simulation Engine ---
+  const simulationData = useMemo(() => {
+    let data = [];
+    
+    // Function to run a single degree step
+    const runStep = (theta, prevI) => {
+      // Determine which thyristors are gated at this instant (check across 3 cycles for wrap-arounds)
+      let G = {};
+      for (let i = 0; i < 6; i++) {
+        let p = activePulses[i];
+        let isGated = false;
+        for (let offset of [-360, 0, 360]) {
+          if (theta >= p.start + offset && theta <= p.start + p.width + offset) {
+            isGated = true; break;
+          }
+        }
+        G[i + 1] = isGated;
+      }
+
+      let Va = vA(theta), Vb = vB(theta), Vc = vC(theta);
+
+      // Check if a specific phase path can conduct
+      const canConduct = (phase, I_val) => {
+        if (Math.abs(I_val) < 1e-4) return true;
+        if (phase === 'a') return (I_val > 0 && (G[1] || prevI.a > 1e-4)) || (I_val < 0 && (G[4] || prevI.a < -1e-4));
+        if (phase === 'b') return (I_val > 0 && (G[3] || prevI.b > 1e-4)) || (I_val < 0 && (G[6] || prevI.b < -1e-4));
+        if (phase === 'c') return (I_val > 0 && (G[5] || prevI.c > 1e-4)) || (I_val < 0 && (G[2] || prevI.c < -1e-4));
+        return false;
+      };
+
+      // Priority 1: 3-Phase Conduction
+      if (canConduct('a', Va) && canConduct('b', Vb) && canConduct('c', Vc)) {
+        return { ia: Va, ib: Vb, ic: Vc, van: Va, vbn: Vb, vcn: Vc, state: 'ABC', G };
+      }
+
+      // Priority 2: 2-Phase Conduction
+      let i_ab = (Va - Vb) / 2;
+      let i_bc = (Vb - Vc) / 2;
+      let i_ca = (Vc - Va) / 2;
+
+      let valid_ab = canConduct('a', i_ab) && canConduct('b', -i_ab);
+      let valid_bc = canConduct('b', i_bc) && canConduct('c', -i_bc);
+      let valid_ca = canConduct('c', i_ca) && canConduct('a', -i_ca);
+
+      let num_valid = (valid_ab ? 1 : 0) + (valid_bc ? 1 : 0) + (valid_ca ? 1 : 0);
+
+      if (num_valid > 0) {
+        // If multiple paths valid, pick the one driven by the highest line voltage
+        let maxV = -1, sel = '';
+        if (valid_ab && Math.abs(Va - Vb) > maxV) { maxV = Math.abs(Va - Vb); sel = 'ab'; }
+        if (valid_bc && Math.abs(Vb - Vc) > maxV) { maxV = Math.abs(Vb - Vc); sel = 'bc'; }
+        if (valid_ca && Math.abs(Vc - Va) > maxV) { maxV = Math.abs(Vc - Va); sel = 'ca'; }
+
+        if (sel === 'ab') return { ia: i_ab, ib: -i_ab, ic: 0, van: i_ab, vbn: -i_ab, vcn: 0, state: 'AB', G };
+        if (sel === 'bc') return { ia: 0, ib: i_bc, ic: -i_bc, van: 0, vbn: i_bc, vcn: -i_bc, state: 'BC', G };
+        if (sel === 'ca') return { ia: -i_ca, ib: 0, ic: i_ca, van: -i_ca, vbn: 0, vcn: i_ca, state: 'CA', G };
+      }
+
+      // Priority 3: No Conduction
+      return { ia: 0, ib: 0, ic: 0, van: 0, vbn: 0, vcn: 0, state: 'NONE', G };
+    };
+
+    // Pre-simulate 1 cycle to establish steady-state initial currents
+    let prevI = { a: 0, b: 0, c: 0 };
+    for (let theta = 0; theta < 360; theta++) {
+      let res = runStep(theta, prevI);
+      prevI = { a: res.ia, b: res.ib, c: res.ic };
+    }
+
+    // Actual simulation for 2 cycles (0 to 720 degrees)
+    for (let theta = 0; theta <= 720; theta++) {
+      let res = runStep(theta, prevI);
+      data.push({ theta, ...res, Va: vA(theta), Vb: vB(theta), Vc: vC(theta) });
+      prevI = { a: res.ia, b: res.ib, c: res.ic };
+    }
+
+    return data;
+  }, [activePulses]);
+
+  // --- SVG Path Generators ---
+  const generatePath = (key, centerY, scale = 1) => {
+    return `M 0 ${centerY - simulationData[0][key] * scale} ` + 
+           simulationData.map(d => `L ${d.theta} ${centerY - d[key] * scale}`).join(' ');
+  };
+
+  const generateLineVoltagePath = (phase1, phase2, centerY, scale = 1) => {
+    return `M 0 ${centerY - (simulationData[0][phase1] - simulationData[0][phase2]) * scale} ` + 
+           simulationData.map(d => `L ${d.theta} ${centerY - (d[phase1] - d[phase2]) * scale}`).join(' ');
+  };
+
+  // --- Interaction Handlers ---
+  const getSvgX = (clientX) => {
+    if (!svgRef.current) return 0;
+    const pt = svgRef.current.createSVGPoint();
+    pt.x = clientX;
+    pt.y = 0;
+    const svgP = pt.matrixTransform(svgRef.current.getScreenCTM().inverse());
+    return svgP.x;
+  };
+
+  const handlePointerDown = (e, index, type) => {
+    if (isSymmetric) return; // Prevent individual dragging in symmetric mode
+    e.stopPropagation();
+    e.target.setPointerCapture(e.pointerId);
+    setDragState({
+      index,
+      type,
+      startX: getSvgX(e.clientX),
+      originalStart: customPulses[index].start,
+      originalWidth: customPulses[index].width
+    });
+  };
+
+  const handlePointerMove = (e) => {
+    if (!dragState || isSymmetric) return;
+    const currentX = getSvgX(e.clientX);
+    const deltaX = currentX - dragState.startX;
+
+    setCustomPulses(prev => {
+      const newPulses = [...prev];
+      const p = { ...newPulses[dragState.index] };
+
+      if (dragState.type === 'start') {
+        let newStart = dragState.originalStart + deltaX;
+        let newWidth = dragState.originalWidth - deltaX;
+        if (newWidth < 10) {
+          newWidth = 10;
+          newStart = dragState.originalStart + dragState.originalWidth - 10;
+        }
+        p.start = (newStart % 360 + 360) % 360; // Keep in 0-360 range ideally, but allow free drag visually
+        // For simpler UX in custom mode, we let start be absolute in the timeline and rely on modulo in logic
+        p.start = Math.max(0, newStart);
+        p.width = newWidth;
+      } else {
+        let newWidth = dragState.originalWidth + deltaX;
+        p.width = Math.max(10, newWidth);
+      }
+      newPulses[dragState.index] = p;
+      return newPulses;
+    });
+  };
+
+  const handlePointerUp = (e) => {
+    if (dragState) {
+      e.target.releasePointerCapture(e.pointerId);
+      setDragState(null);
+    }
+  };
+
+  return (
+    <div className="min-h-screen bg-slate-900 text-slate-200 p-6 font-sans">
+      <div className="max-w-6xl mx-auto">
+        <header className="mb-6 border-b border-slate-700 pb-4">
+          <h1 className="text-2xl font-bold text-white mb-2">Three-Phase AC Controller Simulation</h1>
+          <p className="text-slate-400 text-sm">
+            Interactive visualization of a full-wave AC controller with a star-connected resistive load. 
+            Adjust the firing angle or drag the gate pulses to see the instantaneous output voltages.
+          </p>
+        </header>
+
+        {/* Controls */}
+        <div className="bg-slate-800 p-5 rounded-xl mb-6 shadow-lg border border-slate-700 flex flex-col md:flex-row gap-6 items-center justify-between">
+          <div className="flex-1 w-full space-y-4">
+            <div className="flex items-center justify-between mb-2">
+              <label className="text-sm font-semibold">Mode:</label>
+              <button 
+                onClick={() => {
+                  if (!isSymmetric) {
+                    // Reset to symmetric safely
+                    setCustomPulses(activePulses);
+                  }
+                  setIsSymmetric(!isSymmetric);
+                }}
+                className={`px-4 py-1.5 rounded-full text-sm font-medium transition-colors ${
+                  isSymmetric ? 'bg-blue-600 text-white' : 'bg-slate-700 text-slate-300 hover:bg-slate-600'
+                }`}
+              >
+                {isSymmetric ? 'Symmetric (Sliders)' : 'Custom (Drag Pulses)'}
+              </button>
+            </div>
+            
+            <div className={`space-y-4 transition-opacity ${!isSymmetric ? 'opacity-50 pointer-events-none' : 'opacity-100'}`}>
+              <div>
+                <div className="flex justify-between mb-1">
+                  <label className="text-sm text-slate-300">Firing Angle (α)</label>
+                  <span className="text-sm font-mono text-blue-400">{alpha}°</span>
+                </div>
+                <input 
+                  type="range" min="0" max="180" value={alpha} 
+                  onChange={(e) => setAlpha(Number(e.target.value))}
+                  className="w-full h-2 bg-slate-700 rounded-lg appearance-none cursor-pointer accent-blue-500"
+                />
+              </div>
+              
+              <div>
+                <div className="flex justify-between mb-1">
+                  <label className="text-sm text-slate-300">Pulse Width</label>
+                  <span className="text-sm font-mono text-purple-400">{pulseWidth}°</span>
+                </div>
+                <input 
+                  type="range" min="10" max="180" value={pulseWidth} 
+                  onChange={(e) => setPulseWidth(Number(e.target.value))}
+                  className="w-full h-2 bg-slate-700 rounded-lg appearance-none cursor-pointer accent-purple-500"
+                />
+              </div>
+            </div>
+          </div>
+          
+          <div className="flex-1 bg-slate-900/50 p-4 rounded-lg border border-slate-700/50 text-sm space-y-2">
+            <h3 className="font-semibold text-white border-b border-slate-700 pb-1 mb-2">Display Toggles</h3>
+            <div className="grid grid-cols-2 md:grid-cols-3 gap-x-2 gap-y-2">
+              <label className="flex items-center gap-2 cursor-pointer text-slate-300 hover:text-white">
+                <input type="checkbox" checked={visibleTraces.Va} onChange={() => toggleTrace('Va')} className="accent-red-500" />
+                <div className="w-2.5 h-2.5 rounded-full bg-red-500"></div> In V_a
+              </label>
+              <label className="flex items-center gap-2 cursor-pointer text-slate-300 hover:text-white">
+                <input type="checkbox" checked={visibleTraces.Vab} onChange={() => toggleTrace('Vab')} className="accent-pink-500" />
+                <div className="w-2.5 h-2.5 rounded-full bg-pink-500"></div> Line AB
+              </label>
+              <label className="flex items-center gap-2 cursor-pointer text-slate-300 hover:text-white">
+                <input type="checkbox" checked={visibleTraces.van} onChange={() => toggleTrace('van')} className="accent-red-500" />
+                <div className="w-2.5 h-2.5 rounded-full bg-red-500"></div> Out V_an
+              </label>
+
+              <label className="flex items-center gap-2 cursor-pointer text-slate-300 hover:text-white">
+                <input type="checkbox" checked={visibleTraces.Vb} onChange={() => toggleTrace('Vb')} className="accent-green-500" />
+                <div className="w-2.5 h-2.5 rounded-full bg-green-500"></div> In V_b
+              </label>
+              <label className="flex items-center gap-2 cursor-pointer text-slate-300 hover:text-white">
+                <input type="checkbox" checked={visibleTraces.Vbc} onChange={() => toggleTrace('Vbc')} className="accent-cyan-500" />
+                <div className="w-2.5 h-2.5 rounded-full bg-cyan-500"></div> Line BC
+              </label>
+              <label className="flex items-center gap-2 cursor-pointer text-slate-300 hover:text-white">
+                <input type="checkbox" checked={visibleTraces.vbn} onChange={() => toggleTrace('vbn')} className="accent-green-500" />
+                <div className="w-2.5 h-2.5 rounded-full bg-green-500"></div> Out V_bn
+              </label>
+
+              <label className="flex items-center gap-2 cursor-pointer text-slate-300 hover:text-white">
+                <input type="checkbox" checked={visibleTraces.Vc} onChange={() => toggleTrace('Vc')} className="accent-blue-500" />
+                <div className="w-2.5 h-2.5 rounded-full bg-blue-500"></div> In V_c
+              </label>
+              <label className="flex items-center gap-2 cursor-pointer text-slate-300 hover:text-white">
+                <input type="checkbox" checked={visibleTraces.Vca} onChange={() => toggleTrace('Vca')} className="accent-yellow-500" />
+                <div className="w-2.5 h-2.5 rounded-full bg-yellow-500"></div> Line CA
+              </label>
+              <label className="flex items-center gap-2 cursor-pointer text-slate-300 hover:text-white">
+                <input type="checkbox" checked={visibleTraces.vcn} onChange={() => toggleTrace('vcn')} className="accent-blue-500" />
+                <div className="w-2.5 h-2.5 rounded-full bg-blue-500"></div> Out V_cn
+              </label>
+            </div>
+            {!isSymmetric && <div className="mt-2 text-yellow-400 text-xs italic">Custom mode active: Drag edges of the gate pulses below to adjust timings.</div>}
+          </div>
+        </div>
+
+        {/* SVG Plotter */}
+        <div className="bg-slate-900 border border-slate-700 rounded-xl overflow-hidden shadow-2xl relative select-none">
+          <svg 
+            ref={svgRef}
+            viewBox="0 0 720 900" 
+            className="w-full h-auto cursor-crosshair touch-none"
+            onPointerMove={handlePointerMove}
+            onPointerUp={handlePointerUp}
+            onPointerLeave={handlePointerUp}
+          >
+            {/* Grid & Axes */}
+            {[...Array(13)].map((_, i) => (
+              <g key={`grid-x-${i}`}>
+                <line x1={i * 60} y1="0" x2={i * 60} y2="900" stroke={colors.grid} strokeWidth="1" strokeDasharray="4 4" />
+                {i > 0 && <text x={i * 60} y="15" fill={colors.text} fontSize="12" textAnchor="middle">{i * 60}°</text>}
+              </g>
+            ))}
+
+            {/* --- PLOT 1: Input Voltages (Phase & Line) --- */}
+            <g transform="translate(0, 0)">
+              <text x="10" y="30" fill="white" fontSize="14" fontWeight="bold">Source Voltages (Phase & Line)</text>
+              <line x1="0" y1="120" x2="720" y2="120" stroke={colors.grid} strokeWidth="2" />
+              
+              {/* Line Voltages (Faint dashed) */}
+              {visibleTraces.Vab && <path d={generateLineVoltagePath('Va', 'Vb', 120, 0.6)} fill="none" stroke={colors.lineAB} strokeWidth="1" strokeDasharray="4 4" opacity="0.6"/>}
+              {visibleTraces.Vbc && <path d={generateLineVoltagePath('Vb', 'Vc', 120, 0.6)} fill="none" stroke={colors.lineBC} strokeWidth="1" strokeDasharray="4 4" opacity="0.6"/>}
+              {visibleTraces.Vca && <path d={generateLineVoltagePath('Vc', 'Va', 120, 0.6)} fill="none" stroke={colors.lineCA} strokeWidth="1" strokeDasharray="4 4" opacity="0.6"/>}
+              
+              {/* Phase Voltages */}
+              {visibleTraces.Va && <path d={generatePath('Va', 120, 1)} fill="none" stroke={colors.phaseA} strokeWidth="2" opacity="0.8"/>}
+              {visibleTraces.Vb && <path d={generatePath('Vb', 120, 1)} fill="none" stroke={colors.phaseB} strokeWidth="2" opacity="0.8"/>}
+              {visibleTraces.Vc && <path d={generatePath('Vc', 120, 1)} fill="none" stroke={colors.phaseC} strokeWidth="2" opacity="0.8"/>}
+            </g>
+
+            {/* --- PLOT 2: Output Phase Voltages --- */}
+            <g transform="translate(0, 0)">
+              <text x="10" y="250" fill="white" fontSize="14" fontWeight="bold">Output Phase Voltages (V_an, V_bn, V_cn)</text>
+              <line x1="0" y1="380" x2="720" y2="380" stroke={colors.grid} strokeWidth="2" />
+              
+              {/* Phase Outputs */}
+              {visibleTraces.van && <path d={generatePath('van', 380, 1.5)} fill="none" stroke={colors.phaseA} strokeWidth="3" />}
+              {visibleTraces.vbn && <path d={generatePath('vbn', 380, 1.5)} fill="none" stroke={colors.phaseB} strokeWidth="2" opacity="0.7"/>}
+              {visibleTraces.vcn && <path d={generatePath('vcn', 380, 1.5)} fill="none" stroke={colors.phaseC} strokeWidth="2" opacity="0.7"/>}
+            </g>
+
+            {/* --- PLOT 3: Gate Pulses (Interactive) --- */}
+            <g transform="translate(0, 0)">
+              <text x="10" y="550" fill="white" fontSize="14" fontWeight="bold">Thyristor Gate Pulses</text>
+              <line x1="0" y1="560" x2="720" y2="560" stroke={colors.grid} strokeWidth="1" />
+              
+              {[1, 2, 3, 4, 5, 6].map((thyristor, i) => {
+                const yBase = 580 + i * 45;
+                const p = activePulses[i];
+                
+                // For rendering, we draw the pulse and its wrap-arounds for visual continuity
+                const renderPulse = (offset) => {
+                  const startX = p.start + offset;
+                  const endX = startX + p.width;
+                  if (endX < 0 || startX > 720) return null; // Outside view
+                  
+                  return (
+                    <g key={`pulse-${i}-${offset}`}>
+                      {/* Main Pulse Rect */}
+                      <rect 
+                        x={Math.max(0, startX)} 
+                        y={yBase} 
+                        width={Math.min(720 - Math.max(0, startX), endX - Math.max(0, startX))} 
+                        height="30" 
+                        fill={colors.pulse} 
+                        opacity="0.8"
+                        rx="4"
+                      />
+                      
+                      {/* Drag Handles (Only render on the main instance within 0-720 if not symmetric) */}
+                      {!isSymmetric && startX >= -180 && startX <= 720 && (
+                        <>
+                          <rect 
+                            x={startX} y={yBase} width="8" height="30" 
+                            fill="white" opacity="0.5" className="cursor-ew-resize"
+                            onPointerDown={(e) => handlePointerDown(e, i, 'start')}
+                          />
+                          <rect 
+                            x={endX - 8} y={yBase} width="8" height="30" 
+                            fill="white" opacity="0.5" className="cursor-ew-resize"
+                            onPointerDown={(e) => handlePointerDown(e, i, 'end')}
+                          />
+                        </>
+                      )}
+                    </g>
+                  );
+                };
+
+                return (
+                  <g key={`g${thyristor}`}>
+                    <text x="10" y={yBase + 20} fill={colors.text} fontSize="14" fontWeight="bold">g{thyristor}</text>
+                    <line x1="0" y1={yBase+35} x2="720" y2={yBase+35} stroke={colors.grid} strokeWidth="1" opacity="0.5" />
+                    {/* Render standard and wrapped versions for visual cyclicity */}
+                    {renderPulse(-360)}
+                    {renderPulse(0)}
+                    {renderPulse(360)}
+                  </g>
+                );
+              })}
+            </g>
+          </svg>
+        </div>
+      </div>
+    </div>
+  );
+}
