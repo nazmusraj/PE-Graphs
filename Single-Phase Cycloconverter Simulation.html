@@ -1,0 +1,379 @@
+import React, { useState, useMemo, useRef } from 'react';
+
+// --- Math & Constants ---
+const DEG2RAD = Math.PI / 180;
+
+const colors = {
+  vs: '#64748b',       // Slate 500
+  vo: '#f59e0b',       // Amber 500
+  pConv: '#ef4444',    // Red 500
+  nConv: '#3b82f6',    // Blue 500
+  pulse: '#8b5cf6',    // Purple 500
+  grid: '#334155',     // Slate 700
+  text: '#94a3b8'      // Slate 400
+};
+
+// --- Reusable Collapsible Panel Component ---
+const CollapsiblePanel = ({ title, defaultOpen = true, children }) => {
+  const [open, setOpen] = useState(defaultOpen);
+  return (
+    <div className="bg-slate-900 rounded-xl border border-slate-800 shadow-lg mb-4 flex flex-col overflow-hidden">
+      <button
+        className="flex justify-between items-center p-4 focus:outline-none hover:bg-slate-800/50 transition-colors"
+        onClick={() => setOpen(!open)}
+      >
+        <h3 className="text-sm font-bold text-white uppercase tracking-wider">{title}</h3>
+        <svg
+          className={`w-4 h-4 text-slate-400 transform transition-transform duration-200 ${open ? 'rotate-180' : ''}`}
+          fill="none" stroke="currentColor" viewBox="0 0 24 24"
+        >
+          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+        </svg>
+      </button>
+      {open && (
+        <div className="p-4 pt-0 border-t border-slate-800/50 mt-2">
+          {children}
+        </div>
+      )}
+    </div>
+  );
+};
+
+export default function App() {
+  // --- Simulation State ---
+  const [vsRms, setVsRms] = useState(120); // Input RMS Voltage
+  const [fs, setFs] = useState(60);        // Input Frequency (Hz)
+  const [fo, setFo] = useState(20);        // Output Frequency (Hz)
+  const [alpha, setAlpha] = useState(45);  // Firing angle in degrees
+
+  // Handle constraints nicely so math doesn't explode
+  const safeFs = Math.max(1, fs);
+  const safeFo = Math.max(1, fo);
+  const vPeak = vsRms * Math.SQRT2;
+
+  // --- Display Toggles State ---
+  const [show, setShow] = useState({
+    vs: true,
+    minusVs: true,
+    vo: true,
+  });
+
+  const toggle = (key) => setShow(p => ({ ...p, [key]: !p[key] }));
+  const svgRef = useRef(null);
+
+  // --- Calculations ---
+  // RMS voltage of a phase-controlled half-wave (valid for full output due to symmetry)
+  const vOrms = useMemo(() => {
+    const aRad = alpha * DEG2RAD;
+    // Formula: V_s(rms) * sqrt(1 - alpha/pi + sin(2*alpha)/(2*pi))
+    const term = 1 - (aRad / Math.PI) + (Math.sin(2 * aRad) / (2 * Math.PI));
+    return vsRms * Math.sqrt(Math.max(0, term));
+  }, [vsRms, alpha]);
+
+  // --- Simulation Engine ---
+  const simulationData = useMemo(() => {
+    let data = [];
+    const POINTS = 1000;
+    const To = 1 / safeFo; // Time for one full output cycle
+
+    for (let i = 0; i <= POINTS; i++) {
+      const t = (i / POINTS) * To;
+      
+      // Input Source Math
+      const theta_s_rad = 2 * Math.PI * safeFs * t;
+      const theta_s_deg = (theta_s_rad * 180 / Math.PI) % 360;
+      const cycle_angle = theta_s_deg % 180; // Position within the current half-cycle (0 to 180)
+      const isPosHalfVs = theta_s_deg < 180;
+      
+      const vs = vPeak * Math.sin(theta_s_rad);
+      
+      // Cycloconverter Logic
+      // Output is positive for the first half of To, negative for the second half
+      const isPositiveHalfOutput = t < (To / 2);
+      
+      let vo = 0;
+      let pConvOn = isPositiveHalfOutput ? 1 : 0;
+      let nConvOn = !isPositiveHalfOutput ? 1 : 0;
+      
+      let gP1_P2 = 0; // P-converter T1, T2
+      let gP3_P4 = 0; // P-converter T3, T4
+      let gN1_N2 = 0; // N-converter T1', T2'
+      let gN3_N4 = 0; // N-converter T3', T4'
+
+      if (cycle_angle >= alpha) {
+        if (isPositiveHalfOutput) {
+          // P-Converter is active, rectifying to positive
+          vo = Math.abs(vs);
+          if (isPosHalfVs) gP1_P2 = 1;
+          else gP3_P4 = 1;
+        } else {
+          // N-Converter is active, rectifying to negative
+          vo = -Math.abs(vs);
+          if (isPosHalfVs) gN1_N2 = 1;
+          else gN3_N4 = 1;
+        }
+      }
+
+      data.push({
+        t,
+        x: (i / POINTS) * 800, // Map to SVG width 800
+        vs,
+        minus_vs: -vs,
+        vo,
+        pConvOn,
+        nConvOn,
+        gP1_P2, gP3_P4,
+        gN1_N2, gN3_N4
+      });
+    }
+
+    return data;
+  }, [safeFs, safeFo, vPeak, alpha]);
+
+  // --- SVG Plotting Helpers ---
+  const generatePath = (key, centerY, scale = 1) => {
+    return `M ${simulationData[0].x} ${centerY - simulationData[0][key] * scale} ` + 
+           simulationData.map(d => `L ${d.x} ${centerY - d[key] * scale}`).join(' ');
+  };
+
+  const renderPulse = (key, centerY, height) => {
+    let path = `M 0 ${centerY}`;
+    let isHigh = false;
+    
+    simulationData.forEach((d) => {
+      const val = d[key] > 0;
+      if (val !== isHigh) {
+        // Vertical transition
+        path += ` L ${d.x} ${isHigh ? centerY : centerY - height}`;
+        isHigh = val;
+      }
+      // Horizontal hold
+      path += ` L ${d.x} ${isHigh ? centerY - height : centerY}`;
+    });
+    return path;
+  };
+
+  // Vertical Grid Lines based on input frequency half-cycles
+  const gridLines = useMemo(() => {
+    const lines = [];
+    const To = 1 / safeFo;
+    const numHalfCycles = Math.round((safeFs / safeFo) * 2); 
+    
+    for (let i = 0; i <= numHalfCycles; i++) {
+      const t = i * (1 / (2 * safeFs));
+      if (t <= To + 0.0001) { // Floating point safety
+        const x = (t / To) * 800;
+        lines.push({ x, label: `${i}π` });
+      }
+    }
+    return lines;
+  }, [safeFs, safeFo]);
+
+  const voltageScale = 100 / vPeak; // Map peak voltage to 100px vertical space
+
+  return (
+    <div className="min-h-screen bg-slate-950 text-slate-200 p-6 font-sans">
+      <div className="max-w-7xl mx-auto">
+        <header className="mb-6 border-b border-slate-800 pb-4">
+          <h1 className="text-3xl font-bold text-white mb-2">Single-Phase Cycloconverter Simulation</h1>
+          <p className="text-slate-400 text-sm">
+            Step-down cycloconverter analysis showing mathematical waveform synthesis, gating logic, and dynamic RMS voltage evaluation.
+          </p>
+        </header>
+
+        <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 mb-6">
+          
+          {/* Controls Panel (Left) */}
+          <div className="lg:col-span-4">
+            <CollapsiblePanel title="⚙️ Circuit Parameters" defaultOpen={true}>
+              <div className="space-y-5">
+                {/* Voltages & Frequencies */}
+                <div className="grid grid-cols-2 gap-4">
+                  <div>
+                    <label className="text-xs font-semibold text-slate-400 block mb-1">Input V_rms</label>
+                    <input 
+                      type="number" min="1" max="1000" value={vsRms} 
+                      onChange={(e) => setVsRms(Number(e.target.value))}
+                      className="w-full bg-slate-800 border border-slate-700 rounded px-3 py-1.5 text-sm text-white focus:outline-none focus:border-blue-500"
+                    />
+                  </div>
+                  <div>
+                    <label className="text-xs font-semibold text-slate-400 block mb-1">Input f_s (Hz)</label>
+                    <input 
+                      type="number" min="1" max="400" value={fs} 
+                      onChange={(e) => setFs(Number(e.target.value))}
+                      className="w-full bg-slate-800 border border-slate-700 rounded px-3 py-1.5 text-sm text-white focus:outline-none focus:border-blue-500"
+                    />
+                  </div>
+                </div>
+
+                <div>
+                  <div className="flex justify-between items-end mb-1">
+                    <label className="text-xs font-semibold text-slate-400 block">Desired Output f_o (Hz)</label>
+                    <span className="text-[10px] text-amber-500 bg-amber-900/30 px-2 py-0.5 rounded">Ratio: {(fs/fo).toFixed(1)}x</span>
+                  </div>
+                  <input 
+                    type="number" min="1" max={fs} value={fo} 
+                    onChange={(e) => setFo(Number(e.target.value))}
+                    className="w-full bg-slate-800 border border-slate-700 rounded px-3 py-1.5 text-sm text-white focus:outline-none focus:border-blue-500"
+                  />
+                  <p className="text-[10px] text-slate-500 mt-1">For textbook step-down, ensure f_s is an integer multiple of f_o.</p>
+                </div>
+
+                <hr className="border-slate-800" />
+
+                {/* Firing Angle */}
+                <div>
+                  <div className="flex justify-between mb-2">
+                    <label className="text-sm font-medium text-slate-300">Firing Angle (α)</label>
+                    <span className="text-sm font-mono text-purple-400 font-bold">{alpha}°</span>
+                  </div>
+                  <input 
+                    type="range" min="0" max="180" value={alpha} 
+                    onChange={(e) => setAlpha(Number(e.target.value))}
+                    className="w-full h-2 bg-slate-800 rounded-lg appearance-none cursor-pointer accent-purple-500"
+                  />
+                  <div className="flex justify-between text-[10px] text-slate-500 mt-1">
+                    <span>0°</span>
+                    <span>90°</span>
+                    <span>180°</span>
+                  </div>
+                </div>
+              </div>
+            </CollapsiblePanel>
+
+            <CollapsiblePanel title="📊 Real-time Outputs" defaultOpen={true}>
+              <div className="bg-slate-950 p-4 rounded-lg border border-slate-800 text-center">
+                <span className="block text-slate-400 text-xs font-semibold uppercase tracking-widest mb-1">Output RMS Voltage</span>
+                <span className="text-3xl font-mono font-bold text-amber-400">{vOrms.toFixed(2)} V</span>
+                <span className="block text-[10px] text-slate-500 mt-2">Calculated dynamically based on α</span>
+              </div>
+            </CollapsiblePanel>
+          </div>
+
+          {/* Graph Display (Right) */}
+          <div className="lg:col-span-8 flex flex-col gap-4">
+            
+            {/* View Toggles */}
+            <div className="bg-slate-900 rounded-xl border border-slate-800 p-3 shadow-lg flex flex-wrap gap-4 items-center">
+              <span className="text-xs font-bold text-slate-500 uppercase tracking-wider">Visibility:</span>
+              <label className="flex items-center gap-2 text-sm cursor-pointer hover:text-white">
+                <input type="checkbox" checked={show.vs} onChange={() => toggle('vs')} className="accent-slate-400" />
+                <div className="w-3 h-3 bg-slate-500 rounded-full"></div> Input (v_s)
+              </label>
+              <label className="flex items-center gap-2 text-sm cursor-pointer hover:text-white">
+                <input type="checkbox" checked={show.minusVs} onChange={() => toggle('minusVs')} className="accent-slate-600" />
+                <div className="w-3 h-0.5 border-t-2 border-dashed border-slate-600"></div> Inverted (-v_s)
+              </label>
+              <label className="flex items-center gap-2 text-sm cursor-pointer hover:text-white">
+                <input type="checkbox" checked={show.vo} onChange={() => toggle('vo')} className="accent-amber-500" />
+                <div className="w-3 h-3 bg-amber-500 rounded-full"></div> Output (v_o)
+              </label>
+            </div>
+
+            {/* SVG Plotter */}
+            <div className="bg-slate-900 border border-slate-800 rounded-xl overflow-hidden shadow-2xl relative select-none p-4">
+              <svg 
+                ref={svgRef}
+                viewBox="0 0 800 850" 
+                className="w-full h-auto"
+              >
+                {/* --- Grid Lines (Vertical markers for pi) --- */}
+                {gridLines.map((line, i) => (
+                  <g key={`grid-x-${i}`}>
+                    <line x1={line.x} y1="0" x2={line.x} y2="850" stroke={colors.grid} strokeWidth="1" strokeDasharray="4 4" />
+                    {/* Only show labels if there aren't too many to prevent crowding */}
+                    {gridLines.length <= 25 && (
+                       <text x={line.x} y="15" fill={colors.text} fontSize="12" textAnchor="middle" className="font-mono">
+                         {line.label}
+                       </text>
+                    )}
+                  </g>
+                ))}
+
+                {/* =========================================
+                    PLOT 1: Voltages (v_s and v_o)
+                    ========================================= */}
+                <g transform="translate(0, 0)">
+                  <text x="10" y="40" fill="white" fontSize="14" fontWeight="bold">Input & Output Voltages</text>
+                  <line x1="0" y1="160" x2="800" y2="160" stroke={colors.text} strokeWidth="1" opacity="0.5"/>
+                  
+                  {/* Source Voltage v_s */}
+                  {show.vs && <path d={generatePath('vs', 160, voltageScale)} fill="none" stroke={colors.vs} strokeWidth="1.5" opacity="0.6" />}
+                  {/* Inverted Source -v_s */}
+                  {show.minusVs && <path d={generatePath('minus_vs', 160, voltageScale)} fill="none" stroke={colors.vs} strokeWidth="1.5" strokeDasharray="4 4" opacity="0.3" />}
+                  
+                  {/* Output Voltage v_o */}
+                  {show.vo && <path d={generatePath('vo', 160, voltageScale)} fill="none" stroke={colors.vo} strokeWidth="3" opacity="0.9" />}
+                </g>
+
+                {/* =========================================
+                    PLOT 2: Converter Active Envelopes
+                    ========================================= */}
+                <g transform="translate(0, 320)">
+                  <text x="10" y="0" fill="white" fontSize="14" fontWeight="bold">Converter Activation State</text>
+                  
+                  {/* P-Converter Envelope */}
+                  <text x="10" y="25" fill={colors.pConv} fontSize="12">P-Converter ON (Positive Half Output)</text>
+                  <line x1="0" y1="40" x2="800" y2="40" stroke={colors.grid} strokeWidth="1" />
+                  <path d={renderPulse('pConvOn', 40, 20)} fill="none" stroke={colors.pConv} strokeWidth="2" />
+                  <path d={renderPulse('pConvOn', 40, 20)} fill={colors.pConv} stroke="none" opacity="0.1" />
+
+                  {/* N-Converter Envelope */}
+                  <text x="10" y="75" fill={colors.nConv} fontSize="12">N-Converter ON (Negative Half Output)</text>
+                  <line x1="0" y1="90" x2="800" y2="90" stroke={colors.grid} strokeWidth="1" />
+                  <path d={renderPulse('nConvOn', 90, 20)} fill="none" stroke={colors.nConv} strokeWidth="2" />
+                  <path d={renderPulse('nConvOn', 90, 20)} fill={colors.nConv} stroke="none" opacity="0.1" />
+                </g>
+
+                {/* =========================================
+                    PLOT 3: Gate Pulses
+                    ========================================= */}
+                <g transform="translate(0, 470)">
+                  <text x="10" y="0" fill="white" fontSize="14" fontWeight="bold">Thyristor Gate Pulses</text>
+                  
+                  {/* P-Converter Pulses */}
+                  <rect x="0" y="10" width="800" height="150" fill={colors.pConv} opacity="0.03" />
+                  <text x="10" y="30" fill={colors.text} fontSize="12" fontWeight="bold">P-Converter Firing</text>
+
+                  <text x="20" y="60" fill={colors.text} fontSize="12">T1 & T2 (Conducts pos v_s)</text>
+                  <line x1="0" y1="75" x2="800" y2="75" stroke={colors.grid} strokeWidth="1" />
+                  <path d={renderPulse('gP1_P2', 75, 20)} fill="none" stroke={colors.pulse} strokeWidth="2" />
+                  <path d={renderPulse('gP1_P2', 75, 20)} fill={colors.pulse} stroke="none" opacity="0.2" />
+
+                  <text x="20" y="110" fill={colors.text} fontSize="12">T3 & T4 (Conducts neg v_s)</text>
+                  <line x1="0" y1="125" x2="800" y2="125" stroke={colors.grid} strokeWidth="1" />
+                  <path d={renderPulse('gP3_P4', 125, 20)} fill="none" stroke={colors.pulse} strokeWidth="2" />
+                  <path d={renderPulse('gP3_P4', 125, 20)} fill={colors.pulse} stroke="none" opacity="0.2" />
+
+
+                  {/* N-Converter Pulses */}
+                  <rect x="0" y="180" width="800" height="150" fill={colors.nConv} opacity="0.03" />
+                  <text x="10" y="200" fill={colors.text} fontSize="12" fontWeight="bold">N-Converter Firing</text>
+
+                  <text x="20" y="230" fill={colors.text} fontSize="12">T1' & T2' (Conducts pos v_s to neg load)</text>
+                  <line x1="0" y1="245" x2="800" y2="245" stroke={colors.grid} strokeWidth="1" />
+                  <path d={renderPulse('gN1_N2', 245, 20)} fill="none" stroke={colors.pulse} strokeWidth="2" />
+                  <path d={renderPulse('gN1_N2', 245, 20)} fill={colors.pulse} stroke="none" opacity="0.2" />
+
+                  <text x="20" y="280" fill={colors.text} fontSize="12">T3' & T4' (Conducts neg v_s to neg load)</text>
+                  <line x1="0" y1="295" x2="800" y2="295" stroke={colors.grid} strokeWidth="1" />
+                  <path d={renderPulse('gN3_N4', 295, 20)} fill="none" stroke={colors.pulse} strokeWidth="2" />
+                  <path d={renderPulse('gN3_N4', 295, 20)} fill={colors.pulse} stroke="none" opacity="0.2" />
+
+                </g>
+
+                {/* X-Axis Footer */}
+                <g transform="translate(0, 830)">
+                  <line x1="0" y1="0" x2="800" y2="0" stroke="white" strokeWidth="2" />
+                  <text x="780" y="-10" fill="white" fontSize="14" fontStyle="italic" textAnchor="end">time (1 full output cycle T_o)</text>
+                </g>
+              </svg>
+            </div>
+
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
